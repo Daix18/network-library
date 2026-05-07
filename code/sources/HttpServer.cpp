@@ -4,7 +4,6 @@
 
 #include <HttpServer.hpp>
 #include <iostream>
-#include <thread>
 
 using std::cout;
 using std::endl;
@@ -58,6 +57,10 @@ namespace argb
 
             running = true;
 
+            //Lanzamos los hilos especializados
+			connection_thread = std::thread(&HttpServer::accept_connections, this);
+            io_thread = std::thread(&HttpServer::transfer_data, this);
+
             while (running) 
             {
                 accept_connections  ();
@@ -67,6 +70,10 @@ namespace argb
 
                 std::this_thread::yield (); 
             }
+
+			//Al detener el servidor, se espera a que los hilos terminen su ejecucion
+            if (connection_thread.joinable()) connection_thread.join();
+			if (io_thread.joinable()) io_thread.join();
         }
     }
 
@@ -83,6 +90,8 @@ namespace argb
                 context.socket =  std::move (*new_socket); 
                 context.socket.set_blocking (false);
 
+				//Bloqueamos el acceso a la lista de conexiones mientras añadimos la nueva conexión para evitar condiciones de carrera con el hilo de transferencia de datos:
+				std::lock_guard<std::mutex> lock(connections_mutex);
                 connections.emplace (socket_handle, std::move (context));
             }
         }
@@ -94,21 +103,30 @@ namespace argb
 
     void HttpServer::transfer_data ()
     {
-        for (auto & [socket_handle, context] : connections)
+        // Sacamos una copia de las IDs para no bloquear el mapa entero
+        std::vector<Socket::Handle> handles;
         {
-            try 
+            std::lock_guard<std::mutex> lock(connections_mutex);
+            for (auto const& [h, _] : connections) handles.push_back(h);
+        }
+
+        for (auto h : handles) {
+            ConnectionContext* ctx = nullptr;
             {
-                switch (context.state)
-                {
-                    case ConnectionContext::RECEIVING_REQUEST:       receive_request       (context); break;
-                    case ConnectionContext::WRITING_RESPONSE_HEADER: write_response_header (context); break;
-                    case ConnectionContext::WRITING_RESPONSE_BODY:   write_response_body   (context); break;
-                }
+                std::lock_guard<std::mutex> lock(connections_mutex);
+                if (connections.count(h)) ctx = &connections[h];
             }
-            catch (const NetworkException & exception)
-            {
-                cout << "Error during data transfer on connection " << socket_handle << ": " << exception << endl;
-                context.state = ConnectionContext::CLOSED;
+
+            if (ctx && ctx->state != ConnectionContext::CLOSED) {
+                // El I/O (receive/write) se hace FUERA del lock para permitir paralelismo
+                try {
+                    switch (ctx->state) {
+                    case ConnectionContext::RECEIVING_REQUEST:        receive_request(*ctx); break;
+                    case ConnectionContext::WRITING_RESPONSE_HEADER: write_response_header(*ctx); break;
+                    case ConnectionContext::WRITING_RESPONSE_BODY:   write_response_body(*ctx); break;
+                    }
+                }
+                catch (...) { /* Cerrar conexión con un mini-lock */ }
             }
         }
     }
@@ -203,18 +221,27 @@ namespace argb
 
     void HttpServer::run_handlers ()
     {
+        //Protege el bucle for
         for (auto & [socket_handle, context] : connections) 
         {
             if (context.state == ConnectionContext::RUNNING_HANDLER)
             {
                 if (context.handler)
                 {
-                    const bool finished = context.handler->process (context.request, context.response);
-
-                    if (finished)
                     {
-                        context.state = ConnectionContext::WRITING_RESPONSE_HEADER;
+                        std::lock_guard<std::mutex> lock(connections_mutex);
+                        context.state = ConnectionContext::EXCUTING_HANDLER;
                     }
+
+                    // Delegamos la tarea al pool para que el servidor siga respondiendo
+                    pool.enqueue ([this, &context]()
+                    {
+                        const bool finished = context.handler->process (context.request, context.response);
+                        if (finished)
+                        {
+                            context.state = ConnectionContext::WRITING_RESPONSE_HEADER;
+                        }
+                    });
                 }
             }
         }

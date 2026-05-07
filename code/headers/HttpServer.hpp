@@ -10,6 +10,7 @@
 #include <HttpRequestHandlerFactory.hpp>
 #include <snippets.hpp>
 #include <TcpListener.hpp>
+#include <ThreadPool.hpp>
 
 #include <array>
 #include <atomic>
@@ -17,6 +18,9 @@
 #include <memory>
 #include <string>
 #include <string_view>
+
+#include <thread>
+#include <mutex>
 
 namespace argb
 {
@@ -30,6 +34,7 @@ namespace argb
             {
                 RECEIVING_REQUEST,
                 RUNNING_HANDLER,
+				EXCUTING_HANDLER,
                 WRITING_RESPONSE_HEADER,
                 WRITING_RESPONSE_BODY,
                 CLOSED,
@@ -88,6 +93,7 @@ namespace argb
         TcpListener           listener;
         std::atomic<bool>     running{};
         RequestHandlerManager request_handler_manager;
+        ThreadPool pool { 4 };
 
     public:
 
@@ -114,6 +120,10 @@ namespace argb
 
     private:
 
+        std::thread connection_thread;
+		std::thread io_thread;
+		std::mutex connections_mutex;
+
         void accept_connections    ();
         void transfer_data         ();
         void receive_request       (ConnectionContext & context);
@@ -121,7 +131,5 @@ namespace argb
         void write_response_body   (ConnectionContext & context);
         void run_handlers          ();
         void dispose_connections   ();
-
     };
-
 }
